@@ -1,0 +1,9 @@
+[project]
+name = "apple-mail-mcp"
+version = "0.1.0"
+description = "Minimal MCP server for saving Apple Mail drafts"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp==2.2.0",
+]
+

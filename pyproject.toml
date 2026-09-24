@@ -1,9 +1,9 @@
 [project]
 name = "apple-mail-mcp"
 version = "0.1.0"
-description = "Minimal MCP server for saving Apple Mail drafts"
+description = "Local Apple Mail MCP with indexed search and background Apple Events operations"
 requires-python = ">=3.10"
 dependencies = [
     "mcp==2.2.0",
+    "pydantic==2.13.5",
 ]
-

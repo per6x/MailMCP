@@ -12,10 +12,17 @@ from unittest.mock import patch
 import server
 
 
-def mime(subject, files):
+DRAFT_UUID = "4192A339-DC34-4C34-A786-1485843076E8"
+
+
+def mime(subject, files, body="Test body", recipients=None, sender=""):
     message = EmailMessage()
     message["Subject"] = subject
-    message.set_content("Test body")
+    message["X-Universally-Unique-Identifier"] = DRAFT_UUID
+    for kind, addresses in (recipients or {}).items():
+        if addresses: message[kind] = ', '.join(addresses)
+    if sender: message['From'] = sender
+    message.set_content(body)
     for name, data in files:
         message.add_attachment(data, maintype="application", subtype="pdf", filename=name)
     return message.as_string()
@@ -26,6 +33,9 @@ class MailHarness:
 
     def __init__(self, *, corrupt=False, lose_on_close=False, never_ready=False):
         self.subject = ""
+        self.body = ""
+        self.recipients = {}
+        self.sender = ""
         self.files = []
         self.visible_files = []
         self.calls = []
@@ -39,11 +49,19 @@ class MailHarness:
         self.calls.append((script, arguments))
         if script == server.MAIL_SCRIPT:
             self.subject = arguments[-1]
+            self.body = arguments[-1]
+            self.sender = arguments[2]
+            position = 3
+            for kind in ('to', 'cc', 'bcc'):
+                count = int(arguments[position]); position += 1
+                self.recipients[kind] = arguments[position:position+count]
+                position += count
             return "87"  # Compose IDs do not equal saved IDs.
         if script == server.COMPOSE_SCRIPT:
             op = arguments[0]
             if op == "prepare":
                 self.subject = arguments[2]
+                self.body = arguments[3]
             elif op == "attach":
                 path = Path(arguments[2])
                 self.source_paths.append(path)
@@ -59,15 +77,67 @@ class MailHarness:
             return ""
         if script == server.DRAFT_SCRIPT:
             assert arguments[0] == "snapshot"
+            if not arguments[1]:
+                assert arguments[3] == DRAFT_UUID, "Follow saves by stable Mail UUID"
+                assert not arguments[2], "RFC Message-ID changes on every save"
             assert all(p.exists() for p in self.source_paths)
             return json.dumps({
-                "id": 111476 + len(self.calls), "message_id": "test@example.invalid",
-                "subject": self.subject, "source": mime(self.subject, self.visible_files),
+                "id": 111476 + len(self.calls), "message_id": f"save-{len(self.calls)}@example.invalid",
+                "subject": self.subject, "source": mime(self.subject, self.visible_files, self.body, self.recipients, self.sender),
             })
         raise AssertionError("Unexpected script")
 
 
 class AttachmentTests(unittest.TestCase):
+    def test_stale_versions_are_selected_only_by_full_verified_state(self):
+        import time
+        expected=Counter({server._fingerprint("a.pdf",b"a"):1})
+        stale={"id":1,"source":mime("test",[],"body")}
+        current={"id":2,"source":mime("test",[("a.pdf",b"a")],"body")}
+        with patch.object(server,"_run_script",return_value=json.dumps([stale,current])):
+            result=server._wait_for_saved(expected,time.monotonic()+1,draft_uuid=DRAFT_UUID,subject="test",fields={"body":"body"})
+            self.assertEqual(result["id"],2)
+        with patch.object(server,"_run_script",return_value=json.dumps([current,{**current,"id":3}])), patch.object(server,"POLL_INTERVAL",0.001):
+            with self.assertRaisesRegex(server.ToolError,"Multiple saved versions"):
+                server._wait_for_saved(expected,time.monotonic()+0.01,draft_uuid=DRAFT_UUID,subject="test",fields={"body":"body"})
+
+    def test_saved_fields_must_match_body_and_every_recipient_group(self):
+        fields={'body':'Body', 'to':['to@example.invalid'], 'cc':['cc@example.invalid'], 'bcc':['bcc@example.invalid'], 'sender':'from@example.invalid'}
+        source=mime('subject', [], 'Body', {k:fields[k] for k in ('to','cc','bcc')}, fields['sender'])
+        self.assertTrue(server._fields_match(source, fields))
+        for changed in ({'body':'Wrong'}, {'bcc':[]}, {'to':['other@example.invalid']}, {'sender':'other@example.invalid'}):
+            self.assertFalse(server._fields_match(source, {**fields, **changed}))
+
+    def test_unrequested_leading_blank_line_is_rejected(self):
+        self.assertFalse(server._fields_match(mime('test',[],'\nBody'),{'body':'Body'}))
+        self.assertTrue(server._fields_match(mime('test',[],'\nBody'),{'body':'\nBody'}))
+
+    def test_generated_html_hides_only_mail_header_and_escapes_user_text(self):
+        text='  <script>alert("x")</script> & text\nSecond'
+        html=server._body_html(text)
+        self.assertNotIn('<script>',html)
+        html=html.replace('<body>','<body><div class="Apple-Mail-URLShareUserContentTopClass"><br></div>')
+        m=EmailMessage();m.set_content('');m.add_alternative(html,subtype='html')
+        self.assertTrue(server._fields_match(m.as_string(),{'body':text}))
+        without_style=html.replace('div.Apple-Mail-URLShareUserContentTopClass { display: none !important; }','')
+        m=EmailMessage();m.set_content('');m.add_alternative(without_style,subtype='html')
+        self.assertFalse(server._fields_match(m.as_string(),{'body':text}))
+
+    def test_mail_unicode_line_separator_matches_saved_newline(self):
+        expected={'body':'\n\u2028\nBody\u2028Second line\n'}
+        self.assertTrue(server._fields_match(mime('test',[],'\n\n\nBody\nSecond line\n'),expected))
+        self.assertFalse(server._fields_match(mime('test',[],'Body Second line'),expected))
+
+    def test_mail_html_alternative_and_conflicting_bodies(self):
+        message=EmailMessage()
+        message.set_content('')
+        message.add_alternative('<html><head><style>ignored</style></head><body><div><br></div><blockquote><p><span>&nbsp; </span>Indented.</p>\n<p>åäö &amp; text</p><object>attachment preview</object></blockquote></body></html>',subtype='html')
+        expected={'body':'\n  Indented.\nåäö & text\n','to':[],'cc':[],'bcc':[]}
+        self.assertTrue(server._fields_match(message.as_string(),expected))
+        self.assertFalse(server._fields_match(message.as_string(),{**expected,'body':'Wrong text'}))
+        message.get_body(preferencelist=('plain',)).set_content('Conflicting visible text')
+        self.assertFalse(server._fields_match(message.as_string(),expected))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -96,7 +166,7 @@ class AttachmentTests(unittest.TestCase):
         self.assertEqual(operations, ["prepare", "attach", "save", "attach", "save", "close"])
         self.assertTrue(h.closed)
         snapshots = [a for s, a in h.calls if s == server.DRAFT_SCRIPT]
-        self.assertTrue(all(a[2] == "test@example.invalid" for a in snapshots[1:]))
+        self.assertTrue(all(a[3] == DRAFT_UUID and not a[2] for a in snapshots[1:]))
 
     def test_duplicate_filenames_keep_multiplicity_and_contents(self):
         other = Path(self.temp.name) / "b" / "CV å.pdf"
@@ -138,6 +208,12 @@ class AttachmentTests(unittest.TestCase):
                              filename="CV å.pdf", disposition="inline")
         self.assertEqual(server._mime_attachments(m.as_string()),
                          Counter({server._fingerprint("CV å.pdf", b"pdf"): 2}))
+
+    def test_draft_uuid_is_required_before_replacing_marker(self):
+        self.assertEqual(server._draft_uuid(mime("test", [])), DRAFT_UUID)
+        for source in ("Subject: test\n\nbody", "X-Universally-Unique-Identifier: invalid\n\nbody"):
+            with self.assertRaisesRegex(server.ToolError, "stable draft UUID"):
+                server._draft_uuid(source)
 
     def test_subprocess_timeout_is_actionable(self):
         with patch.object(server.subprocess, "run", side_effect=subprocess.TimeoutExpired("osascript", 1)):
